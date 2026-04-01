@@ -34,6 +34,11 @@ type Client struct {
 	transportClosed     chan error
 	afterConnect        func()
 	messages            chan []byte
+
+	// transportMu serializes access to the transport field and
+	// the waitUpgrade / waitHandshake channels so that Send() never
+	// races with transportUpgrade() or Close().
+	transportMu sync.RWMutex
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -51,8 +56,11 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
+	c.transportMu.Lock()
 	c.hadHandshake = sync.Once{}
 	c.waitHandshake = make(chan struct{}, 1)
+	c.transportMu.Unlock()
+
 	err = c.transport.RequestHandshake()
 	if err != nil {
 		return err
@@ -84,10 +92,14 @@ func (c *Client) messageLoop(messages <-chan []byte) {
 }
 
 func (c *Client) transportUpgrade(transport Transport) error {
+	// Lock while mutating state that Send() reads.
+	c.transportMu.Lock()
 	c.hadUpgrade = sync.Once{}
 	c.waitUpgrade = make(chan struct{}, 1)
+
 	err := c.transport.Stop()
 	if err != nil {
+		c.transportMu.Unlock()
 		c.log.Errorf("stop transport: %s", err)
 		return err
 	}
@@ -98,9 +110,11 @@ func (c *Client) transportUpgrade(transport Transport) error {
 	err = c.transport.Run(c.ctx, c.url, c.sid, c.messages, c.transportClosed)
 	if err != nil {
 		close(c.transportClosed)
+		c.transportMu.Unlock()
 		c.log.Errorf("run transport: %s", err)
 		return err
 	}
+	c.transportMu.Unlock()
 
 	return c.sendPacket(&engineio_v4.Message{
 		Type: engineio_v4.PacketPing,
@@ -140,23 +154,32 @@ func (c *Client) handleHandshake(data []byte) error {
 		close(c.waitHandshake)
 	})
 
-	// Call onConnect hook
-	if c.afterConnect != nil {
-		c.afterConnect()
-	}
-
-	// Perform protocol upgrade
+	// Perform protocol upgrade before calling afterConnect so that any
+	// Send() triggered by the callback will observe the new transport
+	// and properly wait for the upgrade probe to complete.
 	if len(handshakeResp.Upgrades) > 0 {
 		for _, newTransportName := range handshakeResp.Upgrades {
 			if c.transport.Transport() == engineio_v4.EngineIOTransport(newTransportName) {
 				break
 			}
 			if newTransport, found := c.supportedTransports[engineio_v4.EngineIOTransport(newTransportName)]; found {
-				return c.transportUpgrade(newTransport)
+				err = c.transportUpgrade(newTransport)
+				if err != nil {
+					return err
+				}
+
+				break
 			} else {
 				c.log.Warnf("unsupported upgrade: %s", handshakeResp.Upgrades[0])
 			}
 		}
+	}
+
+	// Call onConnect hook after the transport upgrade has completed so
+	// that the new transport is fully ready before any callback tries
+	// to send data.
+	if c.afterConnect != nil {
+		c.afterConnect()
 	}
 
 	return nil
@@ -230,12 +253,23 @@ func (c *Client) sendPacket(packet *engineio_v4.Message) error {
 }
 
 func (c *Client) Send(message []byte) error {
-	if c.waitHandshake != nil {
-		<-c.waitHandshake
+	// Snapshot wait channels under the lock so that we never miss a
+	// channel created by a concurrent transportUpgrade or Connect.
+	c.transportMu.RLock()
+	wh := c.waitHandshake
+	wu := c.waitUpgrade
+	c.transportMu.RUnlock()
+
+	if wh != nil {
+		<-wh
 	}
-	if c.waitUpgrade != nil {
-		<-c.waitUpgrade
+	if wu != nil {
+		<-wu
 	}
+
+	// Re-acquire the lock to read the current transport safely.
+	c.transportMu.RLock()
+	defer c.transportMu.RUnlock()
 
 	return c.sendPacket(&engineio_v4.Message{
 		Type: engineio_v4.PacketMessage,
@@ -255,7 +289,11 @@ func (c *Client) On(event string, handler func([]byte)) {
 }
 
 func (c *Client) Close() error {
-	err := c.transport.Stop()
+	c.transportMu.Lock()
+	t := c.transport
+	c.transportMu.Unlock()
+
+	err := t.Stop()
 	if err != nil {
 		return err
 	}
