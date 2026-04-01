@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	engineio_v4 "github.com/maldikhan/go.socket.io/engine.io/v4"
@@ -26,7 +27,7 @@ type Transport struct {
 	onClose     chan<- error
 	stopPooling chan struct{}
 
-	stopped bool
+	stopped atomic.Bool
 }
 
 func (c *Transport) SetHandshake(handshake *engineio_v4.HandshakeResponse) {
@@ -72,7 +73,7 @@ func (c *Transport) Run(
 }
 
 func (c *Transport) Stop() error {
-	if c.stopped {
+	if c.stopped.Load() {
 		return nil
 	}
 	c.stopPooling <- struct{}{}
@@ -93,14 +94,14 @@ func (c *Transport) pollingLoop() error {
 			}
 		case <-c.stopPooling:
 			c.log.Debugf("stop polling")
-			c.stopped = true
+			c.stopped.Store(true)
 			if c.onClose != nil {
 				c.onClose <- c.ctx.Err()
 			}
 			return nil
 		case <-c.ctx.Done():
 			c.log.Debugf("context done, stop http polling")
-			c.stopped = true
+			c.stopped.Store(true)
 			if c.onClose != nil {
 				c.onClose <- c.ctx.Err()
 			}
