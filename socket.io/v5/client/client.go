@@ -28,7 +28,9 @@ type Client struct {
 type namespace struct {
 	client *Client
 
-	name        string
+	name string
+
+	mu          sync.RWMutex
 	handlers    map[string][]func([]interface{})
 	anyHandlers []func(string, []interface{})
 

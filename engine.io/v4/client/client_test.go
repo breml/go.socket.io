@@ -332,6 +332,42 @@ func TestClient_handleHandshake(t *testing.T) {
 		assert.Equal(t, "test-sid", client.sid)
 	})
 
+	t.Run("afterConnect called after upgrade", func(t *testing.T) {
+		handshakeResp := &engineio_v4.HandshakeResponse{
+			Sid:          "test-sid",
+			PingInterval: 25000,
+			PingTimeout:  5000,
+			Upgrades:     []string{"websocket"},
+		}
+		data, _ := json.Marshal(handshakeResp)
+
+		client.transport = mockTransportPolling
+
+		mockTransportPolling.EXPECT().SetHandshake(handshakeResp)
+		mockTransportPolling.EXPECT().Stop().Do(func() {
+			client.transportClosed = make(chan error)
+			close(client.transportClosed)
+		})
+		mockTransportWs.EXPECT().SetHandshake(handshakeResp)
+		mockTransportWs.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("probe"), nil)
+		mockTransportWs.EXPECT().SendMessage([]byte("probe")).Return(nil)
+
+		// Track the order: afterConnect must observe the websocket
+		// transport (i.e. the upgrade must have finished already).
+		var transportDuringCallback Transport
+		client.afterConnect = func() {
+			transportDuringCallback = client.transport
+		}
+
+		client.hadHandshake = sync.Once{}
+		client.waitHandshake = make(chan struct{})
+		err := client.handleHandshake(data)
+		require.NoError(t, err)
+		assert.Equal(t, mockTransportWs, transportDuringCallback,
+			"afterConnect must be called after transport upgrade")
+	})
+
 	t.Run("Successful handshake with wrong upgrade", func(t *testing.T) {
 		handshakeResp := &engineio_v4.HandshakeResponse{
 			Sid:          "test-sid",
@@ -618,6 +654,53 @@ func TestClient_Send(t *testing.T) {
 			assert.Fail(t, "message have not been sent after handshake was completed")
 		}
 	})
+}
+
+func TestClient_Send_waits_for_upgrade(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockParser := mocks.NewMockParser(ctrl)
+	mockTransport := mocks.NewMockTransport(ctrl)
+
+	mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client := &Client{
+		log:       mockLogger,
+		parser:    mockParser,
+		transport: mockTransport,
+	}
+
+	// Simulate an in-progress upgrade: waitUpgrade is set but not yet closed.
+	client.transportMu.Lock()
+	client.waitUpgrade = make(chan struct{})
+	client.transportMu.Unlock()
+
+	sendDone := make(chan error, 1)
+	mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("msg"), nil).AnyTimes()
+	mockTransport.EXPECT().SendMessage([]byte("msg")).Return(nil).AnyTimes()
+
+	go func() {
+		sendDone <- client.Send([]byte("test"))
+	}()
+
+	// Verify Send blocks while upgrade is pending.
+	select {
+	case <-sendDone:
+		t.Fatal("Send should block while upgrade is in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Complete the upgrade.
+	close(client.waitUpgrade)
+
+	select {
+	case err := <-sendDone:
+		assert.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Send should complete after upgrade finishes")
+	}
 }
 
 func TestClient_On(t *testing.T) {
