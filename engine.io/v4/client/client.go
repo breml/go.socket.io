@@ -289,9 +289,9 @@ func (c *Client) On(event string, handler func([]byte)) {
 }
 
 func (c *Client) Close() error {
-	c.transportMu.Lock()
+	c.transportMu.RLock()
 	t := c.transport
-	c.transportMu.Unlock()
+	c.transportMu.RUnlock()
 
 	err := t.Stop()
 	if err != nil {

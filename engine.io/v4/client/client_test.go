@@ -368,6 +368,29 @@ func TestClient_handleHandshake(t *testing.T) {
 			"afterConnect must be called after transport upgrade")
 	})
 
+	t.Run("Handshake with upgrade failure", func(t *testing.T) {
+		handshakeResp := &engineio_v4.HandshakeResponse{
+			Sid:          "test-sid",
+			PingInterval: 25000,
+			PingTimeout:  5000,
+			Upgrades:     []string{"websocket"},
+		}
+		data, _ := json.Marshal(handshakeResp)
+
+		client.transport = mockTransportPolling
+
+		mockTransportPolling.EXPECT().SetHandshake(handshakeResp)
+		mockTransportWs.EXPECT().SetHandshake(handshakeResp)
+		mockTransportPolling.EXPECT().Stop().Return(errors.New("stop failed"))
+		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
+
+		client.hadHandshake = sync.Once{}
+		client.waitHandshake = make(chan struct{})
+		err := client.handleHandshake(data)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "stop failed")
+	})
+
 	t.Run("Successful handshake with wrong upgrade", func(t *testing.T) {
 		handshakeResp := &engineio_v4.HandshakeResponse{
 			Sid:          "test-sid",
