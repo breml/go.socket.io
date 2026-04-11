@@ -27,12 +27,35 @@ func TestTransport_Transport(t *testing.T) {
 func TestTransport_Stop(t *testing.T) {
 	t.Parallel()
 
-	transport := &Transport{
-		stopPooling: make(chan struct{}, 1),
-	}
-	err := transport.Stop()
-	assert.NoError(t, err)
-	assert.Len(t, transport.stopPooling, 1)
+	t.Run("normal stop", func(t *testing.T) {
+		transport := &Transport{
+			stopPooling: make(chan struct{}, 1),
+		}
+		err := transport.Stop()
+		assert.NoError(t, err)
+		assert.Len(t, transport.stopPooling, 1)
+	})
+
+	t.Run("non-blocking when read loop already exited", func(t *testing.T) {
+		// stopPooling is unbuffered and nobody is reading — Stop must not deadlock
+		transport := &Transport{
+			stopPooling: make(chan struct{}),
+		}
+
+		done := make(chan struct{})
+		go func() {
+			err := transport.Stop()
+			assert.NoError(t, err)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Stop returned without blocking — correct
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("Stop() deadlocked on full/unread stopPooling channel")
+		}
+	})
 }
 
 func TestTransport_Run(t *testing.T) {
