@@ -314,6 +314,29 @@ err := client.Close()
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## Contributors
+
+<!-- readme: contributors -start -->
+<table>
+<tr>
+    <td align="center">
+        <a href="https://github.com/maldikhan">
+            <img src="https://avatars.githubusercontent.com/u/1918932?v=4" width="80;" alt="maldikhan"/>
+            <br />
+            <sub><b>maldikhan</b></sub>
+        </a>
+    </td>
+    <td align="center">
+        <a href="https://github.com/breml">
+            <img src="https://avatars.githubusercontent.com/u/6205217?v=4" width="80;" alt="breml"/>
+            <br />
+            <sub><b>breml</b></sub>
+        </a>
+    </td>
+</tr>
+</table>
+<!-- readme: contributors -end -->
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
