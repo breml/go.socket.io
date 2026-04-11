@@ -34,6 +34,7 @@ type Client struct {
 	transportClosed     chan error
 	afterConnect        func()
 	messages            chan []byte
+	messagesDone        chan struct{} // closed when messageLoop exits
 
 	// transportMu serializes access to the transport field and
 	// the waitUpgrade / waitHandshake channels so that Send() never
@@ -46,6 +47,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	// Run main loop
 	c.messages = make(chan []byte, 100)
+	c.messagesDone = make(chan struct{})
 	go c.messageLoop(ctx, c.messages)
 
 	// Run transport
@@ -70,6 +72,9 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 func (c *Client) messageLoop(ctx context.Context, messages <-chan []byte) {
+	if c.messagesDone != nil {
+		defer close(c.messagesDone)
+	}
 	if messages == nil {
 		c.log.Errorf("messages channel is nil, can't read transport messages")
 		return
@@ -335,6 +340,12 @@ func (c *Client) Close() error {
 	}
 	if c.messages != nil {
 		close(c.messages)
+	}
+	// Wait for messageLoop goroutine to finish so that no mock/logger
+	// calls happen after the caller returns (prevents test panics and
+	// ensures clean shutdown).
+	if c.messagesDone != nil {
+		<-c.messagesDone
 	}
 	return nil
 }
