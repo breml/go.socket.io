@@ -45,18 +45,20 @@ type Client struct {
 func (c *Client) Connect(ctx context.Context) error {
 	c.ctx = ctx
 
-	// Run main loop
 	c.messages = make(chan []byte, 100)
-	c.messagesDone = make(chan struct{})
-	go c.messageLoop(ctx, c.messages)
 
-	// Run transport
+	// Run transport before starting the message loop so that a Run()
+	// failure doesn't leak a goroutine.
 	c.transportClosed = make(chan error, 1)
 	err := c.transport.Run(ctx, c.url, c.sid, c.messages, c.transportClosed)
 	if err != nil {
 		close(c.transportClosed)
 		return err
 	}
+
+	// Start the message loop only after Run() succeeds.
+	c.messagesDone = make(chan struct{})
+	go c.messageLoop(ctx, c.messages)
 
 	c.transportMu.Lock()
 	c.hadHandshake = sync.Once{}
@@ -65,6 +67,14 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	err = c.transport.RequestHandshake()
 	if err != nil {
+		// Clean up: stop transport and wait for the message loop to exit
+		// so we don't leak a goroutine.
+		_ = c.transport.Stop()
+		if c.transportClosed != nil {
+			<-c.transportClosed
+		}
+		close(c.messages)
+		<-c.messagesDone
 		return err
 	}
 
@@ -183,6 +193,11 @@ func (c *Client) handleHandshake(data []byte) error {
 			if newTransport, found := c.supportedTransports[engineio_v4.EngineIOTransport(newTransportName)]; found {
 				err = c.transportUpgrade(newTransport)
 				if err != nil {
+					// Close the handshake gate so that any Send() caller
+					// waiting on waitHandshake doesn't block forever.
+					c.hadHandshake.Do(func() {
+						close(c.waitHandshake)
+					})
 					return err
 				}
 
@@ -300,10 +315,16 @@ func (c *Client) Send(message []byte) error {
 		return errors.New("client is closed")
 	}
 
-	return c.sendPacket(&engineio_v4.Message{
+	// Use the snapshotted transport directly instead of sendPacket()
+	// which re-reads c.transport and would race with Close()/upgrade.
+	msg, err := c.parser.Serialize(&engineio_v4.Message{
 		Type: engineio_v4.PacketMessage,
 		Data: message,
 	})
+	if err != nil {
+		return err
+	}
+	return t.SendMessage(msg)
 }
 
 func (c *Client) On(event string, handler func([]byte)) {

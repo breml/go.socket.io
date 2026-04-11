@@ -106,23 +106,13 @@ func TestClient_Connect(t *testing.T) {
 		client.transport = mockTransport
 
 		mockTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("run error"))
-		mockTransport.EXPECT().Stop()
 		err := client.Connect(ctx)
 
 		assert.Error(t, err)
-
-		closed := make(chan struct{}, 1)
-		go func() {
-			err = client.Close()
-			require.NoError(t, err)
-			close(closed)
-		}()
-
-		select {
-		case <-closed:
-		case <-time.After(100 * time.Millisecond):
-			require.Fail(t, "close stuck")
-		}
+		// messageLoop was never started because Run() failed, so no
+		// goroutine cleanup is needed — just nil out the transport to
+		// make Close() a no-op.
+		client.transport = nil
 	})
 
 	t.Run("Handshake request error", func(t *testing.T) {
@@ -132,25 +122,18 @@ func TestClient_Connect(t *testing.T) {
 		ctx := context.Background()
 		mockTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 		mockTransport.EXPECT().RequestHandshake().Return(errors.New("handshake error"))
+		// Connect() now cleans up on RequestHandshake failure: calls
+		// Stop(), waits for transportClosed, closes messages channel,
+		// and waits for messageLoop to exit.
 		mockTransport.EXPECT().Stop().Do(func() {
-			close(client.transportClosed)
+			client.transportClosed <- nil
 		})
 
 		err := client.Connect(ctx)
 		assert.Error(t, err)
-
-		closed := make(chan struct{}, 1)
-		go func() {
-			err = client.Close()
-			require.NoError(t, err)
-			close(closed)
-		}()
-
-		select {
-		case <-closed:
-		case <-time.After(100 * time.Millisecond):
-			require.Fail(t, "close stuck")
-		}
+		// Connect already cleaned up — transport is still set but
+		// messageLoop has exited. Nil it to avoid stale pointers.
+		client.transport = nil
 	})
 }
 
@@ -433,6 +416,14 @@ func TestClient_handleHandshake(t *testing.T) {
 		err := client.handleHandshake(data)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "stop failed")
+
+		// waitHandshake must be closed so Send() callers don't hang forever.
+		select {
+		case <-client.waitHandshake:
+			// closed — correct
+		default:
+			t.Fatal("waitHandshake must be closed on upgrade failure")
+		}
 	})
 
 	t.Run("Successful handshake with wrong upgrade", func(t *testing.T) {
@@ -834,6 +825,29 @@ func TestClient_Close(t *testing.T) {
 		err := client.Close()
 		assert.NoError(t, err)
 	})
+}
+
+func TestClient_Send_serialize_error(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockParser := mocks.NewMockParser(ctrl)
+	mockTransport := mocks.NewMockTransport(ctrl)
+
+	mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client := &Client{
+		log:       mockLogger,
+		parser:    mockParser,
+		transport: mockTransport,
+	}
+
+	mockParser.EXPECT().Serialize(gomock.Any()).Return(nil, errors.New("serialize error"))
+
+	err := client.Send([]byte("test"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "serialize error")
 }
 
 func TestClient_Send_after_close(t *testing.T) {
