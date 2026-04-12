@@ -21,6 +21,7 @@ This library implements a zero side dependency client compatible with the Socket
 
 - [Quick Start](#quick-start)
 - [Features](#features)
+- [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Creating a client](#creating-a-client)
@@ -32,6 +33,7 @@ This library implements a zero side dependency client compatible with the Socket
 - [Limitations](#limitations)
 - [Contributing](#contributing)
 - [License](#license)
+- [Contributors](#contributors)
 - [Acknowledgments](#acknowledgments)
 
 ## Quick Start
