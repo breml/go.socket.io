@@ -11,17 +11,17 @@ func (c *Client) OnAny(handler func(string, []interface{})) {
 }
 
 func (n *namespace) On(event string, handler interface{}) {
-	n.handlers[event] = append(
-		n.handlers[event],
-		n.client.parser.WrapCallback(handler),
-	)
+	wrapped := n.client.parser.WrapCallback(handler)
+
+	n.mu.Lock()
+	n.handlers[event] = append(n.handlers[event], wrapped)
+	n.mu.Unlock()
 }
 
 func (n *namespace) OnAny(handler func(string, []interface{})) {
-	n.anyHandlers = append(
-		n.anyHandlers,
-		handler,
-	)
+	n.mu.Lock()
+	n.anyHandlers = append(n.anyHandlers, handler)
+	n.mu.Unlock()
 }
 
 func (c *Client) onMessage(data []byte) {
@@ -53,7 +53,10 @@ func (c *Client) onMessage(data []byte) {
 func (c *Client) handleConnectError(ns *namespace, payload interface{}) {
 	c.logger.Infof("Connect error, namespace: %s", ns.name)
 
+	ns.mu.RLock()
 	handlers, ok := ns.handlers["error"]
+	ns.mu.RUnlock()
+
 	if !ok {
 		c.logger.Infof("No handlers for event: %s", "error")
 		return
@@ -67,7 +70,10 @@ func (c *Client) handleConnectError(ns *namespace, payload interface{}) {
 func (c *Client) handleDisconnect(ns *namespace, payload interface{}) {
 	c.logger.Infof("Disconnected from namespace: %s", ns.name)
 
+	ns.mu.RLock()
 	handlers, ok := ns.handlers["disconnect"]
+	ns.mu.RUnlock()
+
 	if !ok {
 		c.logger.Infof("No handlers for event: %s", "disconnect")
 		return
@@ -86,7 +92,10 @@ func (c *Client) handleConnect(ns *namespace, payload interface{}) {
 		}
 	})
 
+	ns.mu.RLock()
 	handlers, ok := ns.handlers["connect"]
+	ns.mu.RUnlock()
+
 	if !ok {
 		c.logger.Debugf("No handlers for event: %s", "connect")
 		return
@@ -98,17 +107,18 @@ func (c *Client) handleConnect(ns *namespace, payload interface{}) {
 }
 
 func (c *Client) handleEvent(ns *namespace, event *socketio_v5.Event) {
-
+	ns.mu.RLock()
 	handlers, ok := ns.handlers[event.Name]
-	if !ok && len(ns.anyHandlers) == 0 {
+	anyHandlers := ns.anyHandlers
+	ns.mu.RUnlock()
+
+	if !ok && len(anyHandlers) == 0 {
 		c.logger.Infof("No handlers for event: %s", event.Name)
 		return
 	}
 
-	if len(ns.anyHandlers) > 0 {
-		for _, handler := range ns.anyHandlers {
-			go handler(event.Name, event.Payloads)
-		}
+	for _, handler := range anyHandlers {
+		go handler(event.Name, event.Payloads)
 	}
 
 	for _, handler := range handlers {

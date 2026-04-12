@@ -21,6 +21,7 @@ This library implements a zero side dependency client compatible with the Socket
 
 - [Quick Start](#quick-start)
 - [Features](#features)
+- [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
   - [Creating a client](#creating-a-client)
@@ -32,6 +33,7 @@ This library implements a zero side dependency client compatible with the Socket
 - [Limitations](#limitations)
 - [Contributing](#contributing)
 - [License](#license)
+- [Contributors](#contributors)
 - [Acknowledgments](#acknowledgments)
 
 ## Quick Start
@@ -85,8 +87,13 @@ More usage examples can be found in the [examples](https://github.com/maldikhan/
 - WebSocket and HTTP long-polling transports
 - Authorization support
 - Namespaces support (limited)
+- Concurrency-safe client (all public methods are goroutine-safe)
 - Modular design for easy component replacement
 - Fast JSON parsing with jsoniter (with [custom parser](https://github.com/maldikhan/go.socket.io-parser.jsoniter))
+
+## Requirements
+
+- Go 1.18 or later
 
 ## Installation
 
@@ -307,12 +314,35 @@ err := client.Close()
 - Binary packets are not currently supported
 - Reconnection functionality is not yet implemented (TBD)
 - Full namespace support is not yet implemented (TBD)
-- Syntetic events like reconnect/reconnect_error are not implemented yet (TBD)
+- Synthetic events like reconnect/reconnect_error are not implemented yet (TBD)
 - Contract is stable but may be extended in future releases, please follow socket.io limitations for event naming
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Contributors
+
+<!-- readme: contributors -start -->
+<table>
+<tr>
+    <td align="center">
+        <a href="https://github.com/maldikhan">
+            <img src="https://avatars.githubusercontent.com/u/1918932?v=4" width="80;" alt="maldikhan"/>
+            <br />
+            <sub><b>maldikhan</b></sub>
+        </a>
+    </td>
+    <td align="center">
+        <a href="https://github.com/breml">
+            <img src="https://avatars.githubusercontent.com/u/6205217?v=4" width="80;" alt="breml"/>
+            <br />
+            <sub><b>breml</b></sub>
+        </a>
+    </td>
+</tr>
+</table>
+<!-- readme: contributors -end -->
 
 ## License
 

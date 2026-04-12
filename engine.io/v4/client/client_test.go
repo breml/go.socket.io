@@ -102,49 +102,38 @@ func TestClient_Connect(t *testing.T) {
 	})
 
 	t.Run("Transport run error", func(t *testing.T) {
+		// Reset transport after previous Close() nil'd it out.
+		client.transport = mockTransport
+
 		mockTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("run error"))
-		mockTransport.EXPECT().Stop()
 		err := client.Connect(ctx)
 
 		assert.Error(t, err)
-
-		closed := make(chan struct{}, 1)
-		go func() {
-			err = client.Close()
-			require.NoError(t, err)
-			close(closed)
-		}()
-
-		select {
-		case <-closed:
-		case <-time.After(100 * time.Millisecond):
-			require.Fail(t, "close stuck")
-		}
+		// messageLoop was never started because Run() failed, so no
+		// goroutine cleanup is needed — just nil out the transport to
+		// make Close() a no-op.
+		client.transport = nil
 	})
 
 	t.Run("Handshake request error", func(t *testing.T) {
+		// Reset transport after previous Close() nil'd it out.
+		client.transport = mockTransport
+
 		ctx := context.Background()
 		mockTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 		mockTransport.EXPECT().RequestHandshake().Return(errors.New("handshake error"))
+		// Connect() now cleans up on RequestHandshake failure: calls
+		// Stop(), waits for transportClosed, closes messages channel,
+		// and waits for messageLoop to exit.
 		mockTransport.EXPECT().Stop().Do(func() {
-			close(client.transportClosed)
+			client.transportClosed <- nil
 		})
 
 		err := client.Connect(ctx)
 		assert.Error(t, err)
-
-		closed := make(chan struct{}, 1)
-		go func() {
-			err = client.Close()
-			require.NoError(t, err)
-			close(closed)
-		}()
-
-		select {
-		case <-closed:
-		case <-time.After(100 * time.Millisecond):
-			require.Fail(t, "close stuck")
-		}
+		// Connect already cleaned up — transport is still set but
+		// messageLoop has exited. Nil it to avoid stale pointers.
+		client.transport = nil
 	})
 }
 
@@ -172,7 +161,7 @@ func TestClient_messageLoop(t *testing.T) {
 	t.Run("Handle packet", func(t *testing.T) {
 		mockParser.EXPECT().Parse([]byte("test")).Return(&engineio_v4.Message{Type: engineio_v4.PacketMessage}, nil)
 
-		go client.messageLoop(client.messages)
+		go client.messageLoop(ctx, client.messages)
 		client.messages <- []byte("test")
 		time.Sleep(10 * time.Millisecond)
 	})
@@ -181,7 +170,7 @@ func TestClient_messageLoop(t *testing.T) {
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any()).Times(2)
 		mockParser.EXPECT().Parse([]byte("error")).Return(nil, errors.New("parse error"))
 
-		go client.messageLoop(client.messages)
+		go client.messageLoop(ctx, client.messages)
 		client.messages <- []byte("error")
 		time.Sleep(10 * time.Millisecond)
 	})
@@ -189,14 +178,14 @@ func TestClient_messageLoop(t *testing.T) {
 	t.Run("Context done", func(t *testing.T) {
 		mockLogger.EXPECT().Warnf("context done, engine.io client stopped processing messages").AnyTimes()
 		messages := make(chan []byte, 1)
-		go client.messageLoop(messages)
+		go client.messageLoop(ctx, messages)
 		cancel()
 		time.Sleep(10 * time.Millisecond)
 	})
 
 	t.Run("NIL messages channel", func(t *testing.T) {
 		mockLogger.EXPECT().Errorf("messages channel is nil, can't read transport messages")
-		client.messageLoop(nil)
+		client.messageLoop(ctx, nil)
 	})
 }
 
@@ -234,21 +223,59 @@ func TestClient_transportUpgrade(t *testing.T) {
 		assert.Equal(t, mockNewTransport, client.transport)
 	})
 
-	t.Run("stop transport error", func(t *testing.T) {
+	t.Run("stop transport error unblocks waitUpgrade", func(t *testing.T) {
 		client.transport = mockOldTransport
 		mockOldTransport.EXPECT().Stop().Return(errors.New("oops"))
 		err := client.transportUpgrade(mockNewTransport)
 		assert.ErrorContains(t, err, "oops")
 		assert.Equal(t, mockOldTransport, client.transport)
+
+		// waitUpgrade must be closed so Send() callers don't hang forever.
+		select {
+		case <-client.waitUpgrade:
+			// closed — correct
+		default:
+			t.Fatal("waitUpgrade must be closed on Stop() failure")
+		}
 	})
 
-	t.Run("start new transport error", func(t *testing.T) {
+	t.Run("start new transport error unblocks waitUpgrade", func(t *testing.T) {
+		client.transport = mockOldTransport
 		mockOldTransport.EXPECT().Stop().Return(nil)
 		client.transportClosed <- nil
 		mockNewTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("oops"))
 		err := client.transportUpgrade(mockNewTransport)
 		assert.ErrorContains(t, err, "oops")
 		assert.Equal(t, mockNewTransport, client.transport)
+
+		// waitUpgrade must be closed so Send() callers don't hang forever.
+		select {
+		case <-client.waitUpgrade:
+			// closed — correct
+		default:
+			t.Fatal("waitUpgrade must be closed on Run() failure")
+		}
+	})
+
+	t.Run("probe send error unblocks waitUpgrade", func(t *testing.T) {
+		client.transport = mockOldTransport
+		mockOldTransport.EXPECT().Stop().Return(nil)
+		client.transportClosed = make(chan error, 1)
+		client.transportClosed <- nil
+		mockNewTransport.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("probe"), nil)
+		mockNewTransport.EXPECT().SendMessage([]byte("probe")).Return(errors.New("send failed"))
+
+		err := client.transportUpgrade(mockNewTransport)
+		assert.ErrorContains(t, err, "send failed")
+
+		// waitUpgrade must be closed so Send() callers don't hang forever.
+		select {
+		case <-client.waitUpgrade:
+			// closed — correct
+		default:
+			t.Fatal("waitUpgrade must be closed on probe send failure")
+		}
 	})
 
 }
@@ -330,6 +357,73 @@ func TestClient_handleHandshake(t *testing.T) {
 			assert.Fail(t, "handshake not completed")
 		}
 		assert.Equal(t, "test-sid", client.sid)
+	})
+
+	t.Run("afterConnect called after upgrade", func(t *testing.T) {
+		handshakeResp := &engineio_v4.HandshakeResponse{
+			Sid:          "test-sid",
+			PingInterval: 25000,
+			PingTimeout:  5000,
+			Upgrades:     []string{"websocket"},
+		}
+		data, _ := json.Marshal(handshakeResp)
+
+		client.transport = mockTransportPolling
+
+		mockTransportPolling.EXPECT().SetHandshake(handshakeResp)
+		mockTransportPolling.EXPECT().Stop().Do(func() {
+			client.transportClosed = make(chan error)
+			close(client.transportClosed)
+		})
+		mockTransportWs.EXPECT().SetHandshake(handshakeResp)
+		mockTransportWs.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("probe"), nil)
+		mockTransportWs.EXPECT().SendMessage([]byte("probe")).Return(nil)
+
+		// Track the order: afterConnect must observe the websocket
+		// transport (i.e. the upgrade must have finished already).
+		var transportDuringCallback Transport
+		client.afterConnect = func() {
+			transportDuringCallback = client.transport
+		}
+
+		client.hadHandshake = sync.Once{}
+		client.waitHandshake = make(chan struct{})
+		err := client.handleHandshake(data)
+		require.NoError(t, err)
+		assert.Equal(t, mockTransportWs, transportDuringCallback,
+			"afterConnect must be called after transport upgrade")
+	})
+
+	t.Run("Handshake with upgrade failure", func(t *testing.T) {
+		handshakeResp := &engineio_v4.HandshakeResponse{
+			Sid:          "test-sid",
+			PingInterval: 25000,
+			PingTimeout:  5000,
+			Upgrades:     []string{"websocket"},
+		}
+		data, _ := json.Marshal(handshakeResp)
+
+		client.transport = mockTransportPolling
+
+		mockTransportPolling.EXPECT().SetHandshake(handshakeResp)
+		mockTransportWs.EXPECT().SetHandshake(handshakeResp)
+		mockTransportPolling.EXPECT().Stop().Return(errors.New("stop failed"))
+		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
+
+		client.hadHandshake = sync.Once{}
+		client.waitHandshake = make(chan struct{})
+		err := client.handleHandshake(data)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "stop failed")
+
+		// waitHandshake must be closed so Send() callers don't hang forever.
+		select {
+		case <-client.waitHandshake:
+			// closed — correct
+		default:
+			t.Fatal("waitHandshake must be closed on upgrade failure")
+		}
 	})
 
 	t.Run("Successful handshake with wrong upgrade", func(t *testing.T) {
@@ -620,6 +714,53 @@ func TestClient_Send(t *testing.T) {
 	})
 }
 
+func TestClient_Send_waits_for_upgrade(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockParser := mocks.NewMockParser(ctrl)
+	mockTransport := mocks.NewMockTransport(ctrl)
+
+	mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client := &Client{
+		log:       mockLogger,
+		parser:    mockParser,
+		transport: mockTransport,
+	}
+
+	// Simulate an in-progress upgrade: waitUpgrade is set but not yet closed.
+	client.transportMu.Lock()
+	client.waitUpgrade = make(chan struct{})
+	client.transportMu.Unlock()
+
+	sendDone := make(chan error, 1)
+	mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("msg"), nil).AnyTimes()
+	mockTransport.EXPECT().SendMessage([]byte("msg")).Return(nil).AnyTimes()
+
+	go func() {
+		sendDone <- client.Send([]byte("test"))
+	}()
+
+	// Verify Send blocks while upgrade is pending.
+	select {
+	case <-sendDone:
+		t.Fatal("Send should block while upgrade is in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Complete the upgrade.
+	close(client.waitUpgrade)
+
+	select {
+	case err := <-sendDone:
+		assert.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Send should complete after upgrade finishes")
+	}
+}
+
 func TestClient_On(t *testing.T) {
 	client := &Client{}
 
@@ -663,9 +804,13 @@ func TestClient_Close(t *testing.T) {
 
 		err := client.Close()
 		assert.NoError(t, err)
+		assert.Nil(t, client.transport, "transport must be nil after close")
 	})
 
 	t.Run("Failed close", func(t *testing.T) {
+		// Reset transport after previous Close() nil'd it out.
+		client.transport = mockTransport
+		client.transportClosed = make(chan error, 1)
 
 		mockTransport.EXPECT().Stop().Return(errors.New("oops"))
 		client.transportClosed <- nil
@@ -673,4 +818,52 @@ func TestClient_Close(t *testing.T) {
 		err := client.Close()
 		assert.ErrorContains(t, err, "oops")
 	})
+
+	t.Run("Close when already closed", func(t *testing.T) {
+		// transport is nil after a previous close — should return nil, not panic.
+		client.transport = nil
+		err := client.Close()
+		assert.NoError(t, err)
+	})
+}
+
+func TestClient_Send_serialize_error(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockParser := mocks.NewMockParser(ctrl)
+	mockTransport := mocks.NewMockTransport(ctrl)
+
+	mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client := &Client{
+		log:       mockLogger,
+		parser:    mockParser,
+		transport: mockTransport,
+	}
+
+	mockParser.EXPECT().Serialize(gomock.Any()).Return(nil, errors.New("serialize error"))
+
+	err := client.Send([]byte("test"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "serialize error")
+}
+
+func TestClient_Send_after_close(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockParser := mocks.NewMockParser(ctrl)
+
+	client := &Client{
+		log:       mockLogger,
+		parser:    mockParser,
+		transport: nil, // simulate closed client
+	}
+
+	err := client.Send([]byte("test"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "client is closed")
 }

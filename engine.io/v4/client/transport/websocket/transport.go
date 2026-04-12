@@ -26,7 +26,13 @@ func (c *Transport) Transport() engineio_v4.EngineIOTransport {
 }
 
 func (c *Transport) Stop() (err error) {
-	c.stopPooling <- struct{}{}
+	// Use non-blocking send: if wsReadLoop already exited (e.g. via
+	// ctx.Done() or a WebSocket error), nobody is reading from
+	// stopPooling and a blocking send would deadlock.
+	select {
+	case c.stopPooling <- struct{}{}:
+	default:
+	}
 	return nil
 }
 

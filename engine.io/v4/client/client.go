@@ -34,16 +34,21 @@ type Client struct {
 	transportClosed     chan error
 	afterConnect        func()
 	messages            chan []byte
+	messagesDone        chan struct{} // closed when messageLoop exits
+
+	// transportMu serializes access to the transport field and
+	// the waitUpgrade / waitHandshake channels so that Send() never
+	// races with transportUpgrade() or Close().
+	transportMu sync.RWMutex
 }
 
 func (c *Client) Connect(ctx context.Context) error {
 	c.ctx = ctx
 
-	// Run main loop
 	c.messages = make(chan []byte, 100)
-	go c.messageLoop(c.messages)
 
-	// Run transport
+	// Run transport before starting the message loop so that a Run()
+	// failure doesn't leak a goroutine.
 	c.transportClosed = make(chan error, 1)
 	err := c.transport.Run(ctx, c.url, c.sid, c.messages, c.transportClosed)
 	if err != nil {
@@ -51,17 +56,35 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
+	// Start the message loop only after Run() succeeds.
+	c.messagesDone = make(chan struct{})
+	go c.messageLoop(ctx, c.messages)
+
+	c.transportMu.Lock()
 	c.hadHandshake = sync.Once{}
 	c.waitHandshake = make(chan struct{}, 1)
+	c.transportMu.Unlock()
+
 	err = c.transport.RequestHandshake()
 	if err != nil {
+		// Clean up: stop transport and wait for the message loop to exit
+		// so we don't leak a goroutine.
+		_ = c.transport.Stop()
+		if c.transportClosed != nil {
+			<-c.transportClosed
+		}
+		close(c.messages)
+		<-c.messagesDone
 		return err
 	}
 
 	return nil
 }
 
-func (c *Client) messageLoop(messages <-chan []byte) {
+func (c *Client) messageLoop(ctx context.Context, messages <-chan []byte) {
+	if c.messagesDone != nil {
+		defer close(c.messagesDone)
+	}
 	if messages == nil {
 		c.log.Errorf("messages channel is nil, can't read transport messages")
 		return
@@ -76,7 +99,7 @@ func (c *Client) messageLoop(messages <-chan []byte) {
 			if err != nil {
 				c.log.Errorf("handle packet error: %s", err)
 			}
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			c.log.Warnf("context done, engine.io client stopped processing messages")
 			return
 		}
@@ -84,12 +107,25 @@ func (c *Client) messageLoop(messages <-chan []byte) {
 }
 
 func (c *Client) transportUpgrade(transport Transport) error {
+	// Lock while mutating state that Send() reads.
+	c.transportMu.Lock()
 	c.hadUpgrade = sync.Once{}
 	c.waitUpgrade = make(chan struct{}, 1)
+
+	// failUpgrade closes the upgrade gate so that Send() callers waiting
+	// on waitUpgrade are unblocked even when the upgrade fails.
+	failUpgrade := func(err error) error {
+		c.hadUpgrade.Do(func() {
+			close(c.waitUpgrade)
+		})
+		c.transportMu.Unlock()
+		return err
+	}
+
 	err := c.transport.Stop()
 	if err != nil {
 		c.log.Errorf("stop transport: %s", err)
-		return err
+		return failUpgrade(err)
 	}
 	<-c.transportClosed
 	c.transport = transport
@@ -99,13 +135,23 @@ func (c *Client) transportUpgrade(transport Transport) error {
 	if err != nil {
 		close(c.transportClosed)
 		c.log.Errorf("run transport: %s", err)
-		return err
+		return failUpgrade(err)
 	}
+	c.transportMu.Unlock()
 
-	return c.sendPacket(&engineio_v4.Message{
+	err = c.sendPacket(&engineio_v4.Message{
 		Type: engineio_v4.PacketPing,
 		Data: []byte("probe"),
 	})
+	if err != nil {
+		// Probe failed — unblock Send() callers waiting on the upgrade gate.
+		c.transportMu.Lock()
+		c.hadUpgrade.Do(func() {
+			close(c.waitUpgrade)
+		})
+		c.transportMu.Unlock()
+	}
+	return err
 }
 
 func (c *Client) handleHandshake(data []byte) error {
@@ -135,28 +181,44 @@ func (c *Client) handleHandshake(data []byte) error {
 		c.pingTimeout = time.Duration(handshakeResp.PingTimeout) * time.Millisecond
 	}
 
-	// close handshake
-	c.hadHandshake.Do(func() {
-		close(c.waitHandshake)
-	})
-
-	// Call onConnect hook
-	if c.afterConnect != nil {
-		c.afterConnect()
-	}
-
-	// Perform protocol upgrade
+	// Perform protocol upgrade BEFORE unblocking Send() callers so that
+	// waitUpgrade is published before waitHandshake is closed. Otherwise
+	// a Send() waiting on waitHandshake would wake with waitUpgrade == nil
+	// and write on the old transport during the upgrade window.
 	if len(handshakeResp.Upgrades) > 0 {
 		for _, newTransportName := range handshakeResp.Upgrades {
 			if c.transport.Transport() == engineio_v4.EngineIOTransport(newTransportName) {
 				break
 			}
 			if newTransport, found := c.supportedTransports[engineio_v4.EngineIOTransport(newTransportName)]; found {
-				return c.transportUpgrade(newTransport)
+				err = c.transportUpgrade(newTransport)
+				if err != nil {
+					// Close the handshake gate so that any Send() caller
+					// waiting on waitHandshake doesn't block forever.
+					c.hadHandshake.Do(func() {
+						close(c.waitHandshake)
+					})
+					return err
+				}
+
+				break
 			} else {
 				c.log.Warnf("unsupported upgrade: %s", handshakeResp.Upgrades[0])
 			}
 		}
+	}
+
+	// Close the handshake gate AFTER the upgrade gate (waitUpgrade) is
+	// already published so Send() sees both gates atomically.
+	c.hadHandshake.Do(func() {
+		close(c.waitHandshake)
+	})
+
+	// Call onConnect hook after the transport upgrade has completed so
+	// that the new transport is fully ready before any callback tries
+	// to send data.
+	if c.afterConnect != nil {
+		c.afterConnect()
 	}
 
 	return nil
@@ -230,17 +292,39 @@ func (c *Client) sendPacket(packet *engineio_v4.Message) error {
 }
 
 func (c *Client) Send(message []byte) error {
-	if c.waitHandshake != nil {
-		<-c.waitHandshake
+	// Snapshot wait channels under the lock so that we never miss a
+	// channel created by a concurrent transportUpgrade or Connect.
+	c.transportMu.RLock()
+	wh := c.waitHandshake
+	wu := c.waitUpgrade
+	c.transportMu.RUnlock()
+
+	if wh != nil {
+		<-wh
 	}
-	if c.waitUpgrade != nil {
-		<-c.waitUpgrade
+	if wu != nil {
+		<-wu
 	}
 
-	return c.sendPacket(&engineio_v4.Message{
+	// Re-acquire the lock to read the current transport safely.
+	c.transportMu.RLock()
+	t := c.transport
+	c.transportMu.RUnlock()
+
+	if t == nil {
+		return errors.New("client is closed")
+	}
+
+	// Use the snapshotted transport directly instead of sendPacket()
+	// which re-reads c.transport and would race with Close()/upgrade.
+	msg, err := c.parser.Serialize(&engineio_v4.Message{
 		Type: engineio_v4.PacketMessage,
 		Data: message,
 	})
+	if err != nil {
+		return err
+	}
+	return t.SendMessage(msg)
 }
 
 func (c *Client) On(event string, handler func([]byte)) {
@@ -255,7 +339,20 @@ func (c *Client) On(event string, handler func([]byte)) {
 }
 
 func (c *Client) Close() error {
-	err := c.transport.Stop()
+	// Write-lock to prevent new Send() calls from acquiring the transport
+	// while we are tearing it down. Setting transport to nil ensures that
+	// any Send() arriving after Close releases the lock will see nil and
+	// fail fast instead of writing on a stopped transport.
+	c.transportMu.Lock()
+	t := c.transport
+	c.transport = nil
+	c.transportMu.Unlock()
+
+	if t == nil {
+		return nil
+	}
+
+	err := t.Stop()
 	if err != nil {
 		return err
 	}
@@ -264,6 +361,12 @@ func (c *Client) Close() error {
 	}
 	if c.messages != nil {
 		close(c.messages)
+	}
+	// Wait for messageLoop goroutine to finish so that no mock/logger
+	// calls happen after the caller returns (prevents test panics and
+	// ensures clean shutdown).
+	if c.messagesDone != nil {
+		<-c.messagesDone
 	}
 	return nil
 }
