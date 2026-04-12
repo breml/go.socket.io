@@ -85,8 +85,13 @@ More usage examples can be found in the [examples](https://github.com/maldikhan/
 - WebSocket and HTTP long-polling transports
 - Authorization support
 - Namespaces support (limited)
+- Concurrency-safe client (all public methods are goroutine-safe)
 - Modular design for easy component replacement
 - Fast JSON parsing with jsoniter (with [custom parser](https://github.com/maldikhan/go.socket.io-parser.jsoniter))
+
+## Requirements
+
+- Go 1.18 or later
 
 ## Installation
 
@@ -307,7 +312,7 @@ err := client.Close()
 - Binary packets are not currently supported
 - Reconnection functionality is not yet implemented (TBD)
 - Full namespace support is not yet implemented (TBD)
-- Syntetic events like reconnect/reconnect_error are not implemented yet (TBD)
+- Synthetic events like reconnect/reconnect_error are not implemented yet (TBD)
 - Contract is stable but may be extended in future releases, please follow socket.io limitations for event naming
 
 ## Contributing
