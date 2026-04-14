@@ -175,11 +175,15 @@ func (c *Client) handleHandshake(data []byte) error {
 		}
 	}
 
-	// Call onConnect hook after the transport upgrade has completed so
-	// that the new transport is fully ready before any callback tries
-	// to send data.
+	// Call onConnect hook in a separate goroutine. The callback typically
+	// issues a Send() (e.g. socket.io CONNECT "40"), which blocks on
+	// waitUpgrade until the transport upgrade probe completes. The probe
+	// response ("3probe") is delivered via c.messages and processed by
+	// messageLoop — the very goroutine executing this handler. Running
+	// afterConnect inline would deadlock: messageLoop can't close
+	// waitUpgrade while it's blocked inside afterConnect.
 	if c.afterConnect != nil {
-		c.afterConnect()
+		go c.afterConnect()
 	}
 
 	return nil
