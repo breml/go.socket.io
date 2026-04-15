@@ -381,16 +381,27 @@ func TestClient_handleHandshake(t *testing.T) {
 		mockTransportWs.EXPECT().SendMessage([]byte("probe")).Return(nil)
 
 		// Track the order: afterConnect must observe the websocket
-		// transport (i.e. the upgrade must have finished already).
+		// transport (i.e. the upgrade probe must already have been
+		// initiated and c.transport swapped to ws). afterConnect runs
+		// in its own goroutine to avoid deadlocking messageLoop on
+		// waitUpgrade, so synchronize via a channel before asserting.
 		var transportDuringCallback Transport
+		done := make(chan struct{})
 		client.afterConnect = func() {
 			transportDuringCallback = client.transport
+			close(done)
 		}
+		defer func() { client.afterConnect = nil }()
 
 		client.hadHandshake = sync.Once{}
 		client.waitHandshake = make(chan struct{})
 		err := client.handleHandshake(data)
 		require.NoError(t, err)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			require.Fail(t, "afterConnect not called")
+		}
 		assert.Equal(t, mockTransportWs, transportDuringCallback,
 			"afterConnect must be called after transport upgrade")
 	})
