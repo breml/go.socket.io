@@ -455,6 +455,12 @@ func TestTransport_wsReadLoop(t *testing.T) {
 // TestTransport_wsReadLoop_FullChannel verifies that wsReadLoop does not block
 // forever when the messages channel is full. When ctx is cancelled or a stop
 // signal arrives, the loop must exit via the inner select, not spin forever.
+//
+// The barrier used here is the "receiveWs: %s" log message, which is emitted
+// inside case C of the outer select, immediately before the inner select.
+// Because it is the only 2-argument Debugf call in wsReadLoop, it can be
+// intercepted without ordering ambiguity. Cancelling/stopping only after this
+// barrier guarantees the test actually exercises the inner select's exit path.
 func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 	t.Parallel()
 
@@ -470,9 +476,11 @@ func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Use a barrier so we know exactly when Receive has returned and the
-		// goroutine is about to block on the inner select.
-		receiveCalled := make(chan struct{})
+		// receiveWsLogged fires when "receiveWs: %s" is logged — the exact point
+		// between the outer select's case C and the inner select. Only then is
+		// the goroutine guaranteed to be blocked on c.messages <- message inside
+		// the inner select.
+		receiveWsLogged := make(chan struct{})
 
 		// Unbuffered messages channel ensures the inner select blocks.
 		messages := make(chan []byte)
@@ -486,16 +494,18 @@ func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 			stopPooling: make(chan struct{}, 1),
 		}
 
+		// "receiveWs: %s" is the only 2-arg Debugf in wsReadLoop; intercept it
+		// specifically to avoid any ordering ambiguity with AnyTimes().
+		mockLogger.EXPECT().Debugf("receiveWs: %s", gomock.Any()).DoAndReturn(
+			func(format string, v ...any) { close(receiveWsLogged) },
+		).Times(1)
 		mockLogger.EXPECT().Debugf(gomock.Any()).AnyTimes()
-		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
 
-		// First Receive closes receiveCalled so the test knows a message is ready.
 		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
 			*msg = []byte("msg")
-			close(receiveCalled)
 			return nil
 		}).Times(1)
-		// After the loop exits via ctx.Done, a second goroutine may still be in Receive.
+		// A background goroutine may still be in Receive after the loop exits.
 		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
 			<-ctx.Done()
 			return ctx.Err()
@@ -506,8 +516,8 @@ func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 			_ = transport.wsReadLoop()
 		}()
 
-		// Wait until the first Receive has been called (message is ready), then cancel.
-		<-receiveCalled
+		// Wait until we are inside case C, right before the inner select.
+		<-receiveWsLogged
 		cancel()
 
 		select {
@@ -529,7 +539,7 @@ func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 
 		ctx := context.Background()
 
-		receiveCalled := make(chan struct{})
+		receiveWsLogged := make(chan struct{})
 
 		messages := make(chan []byte)
 		onClose := make(chan error, 1)
@@ -543,27 +553,23 @@ func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
 			stopPooling: stopPooling,
 		}
 
+		mockLogger.EXPECT().Debugf("receiveWs: %s", gomock.Any()).DoAndReturn(
+			func(format string, v ...any) { close(receiveWsLogged) },
+		).Times(1)
 		mockLogger.EXPECT().Debugf(gomock.Any()).AnyTimes()
-		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
 
 		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
 			*msg = []byte("msg")
-			close(receiveCalled)
 			return nil
 		}).Times(1)
-		// After stop, a second goroutine may still be in Receive — let it block forever
-		// (it gets collected when the test process exits).
-		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
-			<-stopPooling
-			return errors.New("stopped")
-		}).AnyTimes()
 		mockWS.EXPECT().Close().Return(nil).AnyTimes()
 
 		go func() {
 			_ = transport.wsReadLoop()
 		}()
 
-		<-receiveCalled
+		// Wait until we are inside case C, right before the inner select.
+		<-receiveWsLogged
 		stopPooling <- struct{}{}
 
 		select {
