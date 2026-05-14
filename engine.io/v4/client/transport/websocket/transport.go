@@ -152,7 +152,7 @@ func (c *Transport) wsReadLoop() error {
 			select {
 			case c.messages <- message:
 			case <-c.stopPooling:
-				c.log.Debugf("Context cancelled, exiting ws read loop")
+				c.log.Debugf("Stop requested, exiting ws read loop")
 				c.onClose <- nil
 				return nil
 			case <-c.ctx.Done():

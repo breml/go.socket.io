@@ -17,6 +17,12 @@ import (
 	engineio_v4 "github.com/maldikhan/go.socket.io/engine.io/v4"
 )
 
+// errTransportStopped is returned by poll() when it observes the stop
+// signal from stopPooling while blocked sending to c.messages. pollingLoop
+// interprets this as a clean shutdown request (the signal was consumed by
+// poll() so pollingLoop's own stopPooling case will never fire).
+var errTransportStopped = errors.New("transport stopped")
+
 type Transport struct {
 	log        Logger
 	httpClient HttpClient
@@ -100,6 +106,14 @@ func (c *Transport) pollingLoop() error {
 				return errors.New("pinger closed")
 			}
 			err := c.poll()
+			if errors.Is(err, errTransportStopped) {
+				c.log.Debugf("stop polling")
+				atomic.StoreUint32(&c.stopped, 1)
+				if c.onClose != nil {
+					c.onClose <- c.ctx.Err()
+				}
+				return nil
+			}
 			if err != nil {
 				c.log.Errorf("poll error: %s", err)
 			}
@@ -168,6 +182,11 @@ func (c *Transport) poll() error {
 	case c.messages <- body:
 	case <-c.ctx.Done():
 		return c.ctx.Err()
+	case <-c.stopPooling:
+		// Stop was signalled while we were blocked sending. Return the
+		// sentinel so pollingLoop performs the proper shutdown handshake
+		// (the stop signal has been consumed here).
+		return errTransportStopped
 	}
 	return nil
 }
