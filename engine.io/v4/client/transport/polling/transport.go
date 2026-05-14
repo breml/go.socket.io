@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,10 +18,10 @@ import (
 	engineio_v4 "github.com/maldikhan/go.socket.io/engine.io/v4"
 )
 
-// errTransportStopped is returned by poll() when it observes the stop
-// signal from stopPooling while blocked sending to c.messages. pollingLoop
-// interprets this as a clean shutdown request (the signal was consumed by
-// poll() so pollingLoop's own stopPooling case will never fire).
+// errTransportStopped is an internal sentinel returned by poll() when it
+// observes stopCh while blocked sending to c.messages. It stays inside the
+// package: pollingLoop handles it directly, and RequestHandshake maps it to
+// context.Canceled before it can reach public API callers.
 var errTransportStopped = errors.New("transport stopped")
 
 type Transport struct {
@@ -36,6 +37,13 @@ type Transport struct {
 	onClose     chan<- error
 	stopPooling chan struct{}
 
+	// stopCh is closed by Stop() to broadcast the stop signal to any goroutine
+	// currently blocked inside poll(). Using a closed channel (instead of a
+	// buffered send) means both poll() and pollingLoop can observe the stop
+	// independently without competing to consume a single value.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
 	stopped uint32 // atomic; 0 = running, 1 = stopped
 }
 
@@ -49,7 +57,17 @@ func (c *Transport) SetHandshake(handshake *engineio_v4.HandshakeResponse) {
 }
 
 func (c *Transport) RequestHandshake() error {
-	return c.poll()
+	err := c.poll()
+	if errors.Is(err, errTransportStopped) {
+		// Transport was stopped while waiting to deliver the handshake response.
+		// Map the internal sentinel to a public cancellation error so callers
+		// never observe an unexported implementation detail.
+		if ctxErr := c.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return context.Canceled
+	}
+	return err
 }
 
 func (c *Transport) Transport() engineio_v4.EngineIOTransport {
@@ -87,6 +105,12 @@ func (c *Transport) Stop() error {
 	if !atomic.CompareAndSwapUint32(&c.stopped, 0, 1) {
 		return nil
 	}
+	// Close stopCh to broadcast the stop signal to any poll() call that is
+	// currently blocked sending to c.messages. sync.Once guarantees we only
+	// close once even if Stop() is called from multiple goroutines.
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
 	// Non-blocking send: if pollingLoop already exited (e.g. via
 	// ctx.Done()), nobody is reading from stopPooling and a blocking
 	// send would deadlock.
@@ -182,10 +206,10 @@ func (c *Transport) poll() error {
 	case c.messages <- body:
 	case <-c.ctx.Done():
 		return c.ctx.Err()
-	case <-c.stopPooling:
-		// Stop was signalled while we were blocked sending. Return the
-		// sentinel so pollingLoop performs the proper shutdown handshake
-		// (the stop signal has been consumed here).
+	case <-c.stopCh:
+		// Stop() was called while we were blocked sending. stopCh is a closed
+		// channel (broadcast), so pollingLoop's own stopPooling case remains
+		// intact — it will still exit cleanly via the value Stop() enqueued.
 		return errTransportStopped
 	}
 	return nil
