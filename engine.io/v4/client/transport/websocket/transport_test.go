@@ -452,6 +452,129 @@ func TestTransport_wsReadLoop(t *testing.T) {
 	})
 }
 
+// TestTransport_wsReadLoop_FullChannel verifies that wsReadLoop does not block
+// forever when the messages channel is full. When ctx is cancelled or a stop
+// signal arrives, the loop must exit via the inner select, not spin forever.
+func TestTransport_wsReadLoop_FullChannel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("context cancelled while messages channel is full", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockWS := mock_engineio_v4_client_transport.NewMockWebSocket(ctrl)
+		mockLogger := mock_engineio_v4_client_transport.NewMockLogger(ctrl)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Use a barrier so we know exactly when Receive has returned and the
+		// goroutine is about to block on the inner select.
+		receiveCalled := make(chan struct{})
+
+		// Unbuffered messages channel ensures the inner select blocks.
+		messages := make(chan []byte)
+		onClose := make(chan error, 1)
+		transport := &Transport{
+			log:         mockLogger,
+			ws:          mockWS,
+			ctx:         ctx,
+			messages:    messages,
+			onClose:     onClose,
+			stopPooling: make(chan struct{}, 1),
+		}
+
+		mockLogger.EXPECT().Debugf(gomock.Any()).AnyTimes()
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+		// First Receive closes receiveCalled so the test knows a message is ready.
+		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
+			*msg = []byte("msg")
+			close(receiveCalled)
+			return nil
+		}).Times(1)
+		// After the loop exits via ctx.Done, a second goroutine may still be in Receive.
+		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}).AnyTimes()
+		mockWS.EXPECT().Close().Return(nil).AnyTimes()
+
+		go func() {
+			_ = transport.wsReadLoop()
+		}()
+
+		// Wait until the first Receive has been called (message is ready), then cancel.
+		<-receiveCalled
+		cancel()
+
+		select {
+		case err := <-onClose:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("wsReadLoop blocked indefinitely when messages channel was full and context was cancelled")
+		}
+	})
+
+	t.Run("stop signal while messages channel is full", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockWS := mock_engineio_v4_client_transport.NewMockWebSocket(ctrl)
+		mockLogger := mock_engineio_v4_client_transport.NewMockLogger(ctrl)
+
+		ctx := context.Background()
+
+		receiveCalled := make(chan struct{})
+
+		messages := make(chan []byte)
+		onClose := make(chan error, 1)
+		stopPooling := make(chan struct{}, 1)
+		transport := &Transport{
+			log:         mockLogger,
+			ws:          mockWS,
+			ctx:         ctx,
+			messages:    messages,
+			onClose:     onClose,
+			stopPooling: stopPooling,
+		}
+
+		mockLogger.EXPECT().Debugf(gomock.Any()).AnyTimes()
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
+			*msg = []byte("msg")
+			close(receiveCalled)
+			return nil
+		}).Times(1)
+		// After stop, a second goroutine may still be in Receive — let it block forever
+		// (it gets collected when the test process exits).
+		mockWS.EXPECT().Receive(gomock.Any()).DoAndReturn(func(msg *[]byte) error {
+			<-stopPooling
+			return errors.New("stopped")
+		}).AnyTimes()
+		mockWS.EXPECT().Close().Return(nil).AnyTimes()
+
+		go func() {
+			_ = transport.wsReadLoop()
+		}()
+
+		<-receiveCalled
+		stopPooling <- struct{}{}
+
+		select {
+		case err := <-onClose:
+			assert.NoError(t, err)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("wsReadLoop blocked indefinitely when messages channel was full and stop was signalled")
+		}
+	})
+}
+
 func TestTransport_SendMessage(t *testing.T) {
 	t.Parallel()
 

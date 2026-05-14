@@ -545,6 +545,54 @@ func TestPoll(t *testing.T) {
 		err := client.poll()
 		assert.Error(t, err)
 	})
+
+	t.Run("Context cancelled while sending to full messages channel", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockLogger := mocks.NewMockLogger(ctrl)
+		mockHTTPClient := mocks.NewMockHttpClient(ctrl)
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Full channel: poll() must not block forever
+		messagesChan := make(chan []byte)
+
+		client := &Transport{
+			log:        mockLogger,
+			httpClient: mockHTTPClient,
+			url:        &url.URL{Scheme: "http", Host: "example.com", Path: "/socket.io/"},
+			sid:        "test-sid",
+			ctx:        ctx,
+			messages:   messagesChan,
+		}
+
+		mockLogger.EXPECT().Debugf("run polling")
+		mockLogger.EXPECT().Debugf("receiveHttp: %s", "data")
+
+		mockResp := &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader("data")),
+		}
+		mockHTTPClient.EXPECT().Do(gomock.Any()).Return(mockResp, nil)
+
+		done := make(chan error, 1)
+		go func() {
+			done <- client.poll()
+		}()
+
+		// Cancel context while poll() is blocked on the full channel
+		cancel()
+
+		select {
+		case err := <-done:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("poll() blocked indefinitely when messages channel was full and context was cancelled")
+		}
+	})
 }
 
 func TestSendMessage(t *testing.T) {

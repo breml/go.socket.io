@@ -164,7 +164,11 @@ func (c *Transport) poll() error {
 	}
 	c.log.Debugf("receiveHttp: %s", string(body))
 
-	c.messages <- body
+	select {
+	case c.messages <- body:
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
 	return nil
 }
 
