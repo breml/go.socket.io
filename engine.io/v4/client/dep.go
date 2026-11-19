@@ -14,6 +14,12 @@ type Parser interface {
 		*engineio_v4.Message,
 		error,
 	)
+	// ParseBatch decodes a polling response body, which may carry several
+	// packets separated by the record separator (0x1E).
+	ParseBatch([]byte) (
+		[]*engineio_v4.Message,
+		error,
+	)
 	Serialize(*engineio_v4.Message) (
 		[]byte,
 		error,

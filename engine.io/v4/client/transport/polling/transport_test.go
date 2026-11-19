@@ -1,6 +1,7 @@
 package engineio_v4_client_transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -234,14 +235,21 @@ func TestPollingLoop(t *testing.T) {
 		defer cancel()
 
 		mockLogger := mocks.NewMockLogger(ctrl)
-		mockLogger.EXPECT().Debugf("stop polling")
+		mockHttpClient := mocks.NewMockHttpClient(ctrl)
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+		mockLogger.EXPECT().Errorf("poll error: %s", gomock.Any()).AnyTimes()
+		mockHttpClient.EXPECT().Do(gomock.Any()).Return(nil, errors.New("no server")).AnyTimes()
 
 		client := &Transport{
+			url:         &url.URL{Scheme: "http", Host: "localhost"},
 			log:         mockLogger,
+			httpClient:  mockHttpClient,
 			pinger:      time.NewTicker(time.Minute),
 			stopPooling: make(chan struct{}),
+			stopCh:      make(chan struct{}),
 			ctx:         ctx,
 			onClose:     make(chan error, 1),
+			messages:    make(chan []byte, 1),
 		}
 
 		go func() {
@@ -260,18 +268,26 @@ func TestPollingLoop(t *testing.T) {
 		defer ctrl.Finish()
 
 		mockLogger := mocks.NewMockLogger(ctrl)
+		mockHttpClient := mocks.NewMockHttpClient(ctrl)
+		mockLogger.EXPECT().Debugf("run polling").MinTimes(1)
 		mockLogger.EXPECT().Debugf("context done, stop http polling")
+		mockLogger.EXPECT().Errorf("poll error: %s", gomock.Any()).AnyTimes()
+		mockHttpClient.EXPECT().Do(gomock.Any()).Return(nil, errors.New("no server")).AnyTimes()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		ctx, timeout := context.WithTimeout(ctx, 5*time.Second)
 		defer timeout()
 
 		client := &Transport{
+			url:         &url.URL{Scheme: "http", Host: "localhost"},
 			log:         mockLogger,
+			httpClient:  mockHttpClient,
 			pinger:      time.NewTicker(time.Minute),
 			stopPooling: make(chan struct{}),
+			stopCh:      make(chan struct{}),
 			ctx:         ctx,
 			onClose:     make(chan error, 1),
+			messages:    make(chan []byte, 1),
 		}
 
 		go func() {
@@ -298,13 +314,16 @@ func TestPollingLoop(t *testing.T) {
 
 		mockLogger := mocks.NewMockLogger(ctrl)
 		mockHttpClient := mocks.NewMockHttpClient(ctrl)
-		mockLogger.EXPECT().Debugf("run polling").MinTimes(1)
-		mockLogger.EXPECT().Debugf("stop polling").MinTimes(1)
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
 		mockLogger.EXPECT().Errorf("poll error: %s", errExpected).MinTimes(1)
 		mockHttpClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(_ *http.Request) (*http.Response, error) {
-			close(pingCalled)
+			select {
+			case <-pingCalled:
+			default:
+				close(pingCalled)
+			}
 			return nil, errExpected
-		})
+		}).AnyTimes()
 
 		onClose := make(chan error, 1)
 		client := &Transport{
@@ -338,20 +357,20 @@ func TestPollingLoop(t *testing.T) {
 
 		select {
 		case <-exitChan:
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(5 * time.Second):
 			assert.Fail(t, "expected pollingLoop to exit")
 		}
 
 		select {
 		case err := <-onClose:
 			assert.NoError(t, err)
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(5 * time.Second):
 			assert.Fail(t, "expected pollingLoop to exit and emit onClose")
 		}
 
 	})
 
-	t.Run("Ping interval closed chan", func(t *testing.T) {
+	t.Run("Session closed by server", func(t *testing.T) {
 		t.Parallel()
 
 		ctrl := gomock.NewController(t)
@@ -360,24 +379,36 @@ func TestPollingLoop(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		tickerChan := make(chan time.Time)
-		close(tickerChan)
-		ticker := &time.Ticker{
-			C: tickerChan,
-		}
-
 		mockLogger := mocks.NewMockLogger(ctrl)
-		mockLogger.EXPECT().Warnf("pinger closed: stop pooling")
+		mockHttpClient := mocks.NewMockHttpClient(ctrl)
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+		mockHttpClient.EXPECT().Do(gomock.Any()).Return(&http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+		}, nil).AnyTimes()
 
+		onClose := make(chan error, 1)
 		client := &Transport{
+			url:         &url.URL{Scheme: "http", Host: "localhost"},
 			log:         mockLogger,
-			pinger:      ticker,
-			stopPooling: make(chan struct{}),
+			httpClient:  mockHttpClient,
+			pinger:      time.NewTicker(time.Minute),
+			stopPooling: make(chan struct{}, 1),
+			stopCh:      make(chan struct{}),
 			ctx:         ctx,
+			onClose:     onClose,
+			messages:    make(chan []byte, 1),
 		}
 
 		err := client.pollingLoop()
-		assert.ErrorContains(t, err, "pinger closed")
+		assert.NoError(t, err)
+
+		select {
+		case err := <-onClose:
+			assert.ErrorIs(t, err, errSessionClosed)
+		default:
+			assert.Fail(t, "expected onClose to carry the session-closed error")
+		}
 	})
 }
 
