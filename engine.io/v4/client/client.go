@@ -228,12 +228,21 @@ func (c *Client) handleHandshake(data []byte) error {
 
 func (c *Client) handlePacket(packetData []byte) error {
 	c.log.Debugf("handle packet: %s", string(packetData))
-	packet, err := c.parser.Parse(packetData)
+	packets, err := c.parser.ParseBatch(packetData)
 	if err != nil {
 		c.log.Errorf("Can't parse packet: %s %v", string(packetData), err)
 		return err
 	}
 
+	for _, packet := range packets {
+		if err := c.handleOnePacket(packet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) handleOnePacket(packet *engineio_v4.Message) error {
 	c.log.Debugf("handle: %d %s", packet.Type, packet.Data)
 
 	switch packet.Type {

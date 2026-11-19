@@ -24,6 +24,12 @@ import (
 // context.Canceled before it can reach public API callers.
 var errTransportStopped = errors.New("transport stopped")
 
+// errSessionClosed is returned by poll() when the server answers 400, which
+// engine.io uses to report a sid the server no longer holds. pollingLoop
+// surfaces it as a close so the engine.io client can reconnect instead of
+// polling a dead session until the caller's timeout fires.
+var errSessionClosed = errors.New("session closed by server")
+
 type Transport struct {
 	log        Logger
 	httpClient HttpClient
@@ -123,31 +129,30 @@ func (c *Transport) Stop() error {
 
 func (c *Transport) pollingLoop() error {
 	for {
-		select {
-		case _, ok := <-c.pinger.C:
-			if !ok {
-				c.log.Warnf("pinger closed: stop pooling")
-				return errors.New("pinger closed")
-			}
-			err := c.poll()
-			if errors.Is(err, errTransportStopped) {
-				c.log.Debugf("stop polling")
-				atomic.StoreUint32(&c.stopped, 1)
-				if c.onClose != nil {
+		err := c.poll()
+		if errors.Is(err, errTransportStopped) || errors.Is(err, errSessionClosed) {
+			c.log.Debugf("stop polling: %s", err)
+			atomic.StoreUint32(&c.stopped, 1)
+			if c.onClose != nil {
+				if errors.Is(err, errSessionClosed) {
+					c.onClose <- err
+				} else {
 					c.onClose <- c.ctx.Err()
 				}
-				return nil
 			}
-			if err != nil {
-				c.log.Errorf("poll error: %s", err)
-			}
+			return nil
+		}
+		select {
 		case <-c.stopPooling:
-			c.log.Debugf("stop polling")
+			c.log.Debugf("stop pooling")
 			atomic.StoreUint32(&c.stopped, 1)
 			if c.onClose != nil {
 				c.onClose <- c.ctx.Err()
 			}
 			return nil
+		default:
+		}
+		select {
 		case <-c.ctx.Done():
 			c.log.Debugf("context done, stop http polling")
 			atomic.StoreUint32(&c.stopped, 1)
@@ -155,7 +160,16 @@ func (c *Transport) pollingLoop() error {
 				c.onClose <- c.ctx.Err()
 			}
 			return c.ctx.Err()
+		default:
 		}
+		if err != nil {
+			c.log.Errorf("poll error: %s", err)
+			time.Sleep(time.Second) // avoid hot-looping on a dead endpoint
+			continue
+		}
+		// Response received: open the next long-poll immediately, mirroring
+		// the engine.io reference client, so a poll is always in flight and
+		// server heartbeats cannot land in a gap.
 	}
 }
 
@@ -195,6 +209,13 @@ func (c *Transport) poll() error {
 		return err
 	}
 	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode == http.StatusBadRequest {
+		return errSessionClosed
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("poll: unexpected status %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

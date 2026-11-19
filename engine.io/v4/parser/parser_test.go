@@ -59,6 +59,60 @@ func TestEngineIOV4Parser_Parse(t *testing.T) {
 	}
 }
 
+func TestEngineIOV4Parser_ParseBatch(t *testing.T) {
+	parser := &EngineIOV4Parser{}
+	rs := string([]byte{0x1E})
+	tests := []struct {
+		name    string
+		input   []byte
+		want    []*engineio_v4.Message
+		wantErr bool
+	}{
+		{
+			name:  "Single packet without separator",
+			input: []byte("0hello"),
+			want: []*engineio_v4.Message{
+				{Type: engineio_v4.EngineIOPacket(0), Data: []byte("hello")},
+			},
+		},
+		{
+			name:  "Batched packets with separator",
+			input: []byte("4" + rs + "0{\"sid\":\"a\"}" + rs + "4abc"),
+			want: []*engineio_v4.Message{
+				{Type: engineio_v4.EngineIOPacket(4), Data: []byte{}},
+				{Type: engineio_v4.EngineIOPacket(0), Data: []byte(`{"sid":"a"}`)},
+				{Type: engineio_v4.EngineIOPacket(4), Data: []byte("abc")},
+			},
+		},
+		{
+			name:  "Batch with empty part between separators is skipped",
+			input: []byte("4" + rs + rs + "4abc"),
+			want: []*engineio_v4.Message{
+				{Type: engineio_v4.EngineIOPacket(4), Data: []byte{}},
+				{Type: engineio_v4.EngineIOPacket(4), Data: []byte("abc")},
+			},
+		},
+		{
+			name:    "Empty message",
+			input:   []byte{},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parser.ParseBatch(tt.input)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, got)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
 func TestEngineIOV4Parser_Serialize(t *testing.T) {
 	parser := &EngineIOV4Parser{}
 	tests := []struct {

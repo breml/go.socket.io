@@ -65,10 +65,10 @@ func TestClient_Connect(t *testing.T) {
 			}()
 			return nil
 		})
-		mockParser.EXPECT().Parse(gomock.Any()).Return(&engineio_v4.Message{
+		mockParser.EXPECT().ParseBatch(gomock.Any()).Return([]*engineio_v4.Message{&engineio_v4.Message{
 			Type: engineio_v4.PacketOpen,
 			Data: respData,
-		}, nil)
+		}}, nil)
 		mockTransport.EXPECT().SetHandshake(gomock.Any())
 		mockTransport.EXPECT().Stop().Do(func() {
 			close(client.transportClosed)
@@ -159,7 +159,7 @@ func TestClient_messageLoop(t *testing.T) {
 	mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
 
 	t.Run("Handle packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("test")).Return(&engineio_v4.Message{Type: engineio_v4.PacketMessage}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("test")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketMessage}}, nil)
 
 		go client.messageLoop(ctx, client.messages)
 		client.messages <- []byte("test")
@@ -168,7 +168,7 @@ func TestClient_messageLoop(t *testing.T) {
 
 	t.Run("Handle packet error", func(t *testing.T) {
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any()).Times(2)
-		mockParser.EXPECT().Parse([]byte("error")).Return(nil, errors.New("parse error"))
+		mockParser.EXPECT().ParseBatch([]byte("error")).Return(nil, errors.New("parse error"))
 
 		go client.messageLoop(ctx, client.messages)
 		client.messages <- []byte("error")
@@ -498,14 +498,14 @@ func TestClient_handlePacket(t *testing.T) {
 
 	t.Run("Open packet error (wrong handshake)", func(t *testing.T) {
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
-		mockParser.EXPECT().Parse([]byte("open")).Return(&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte("{}")}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("open")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte("{}")}}, nil)
 		err := client.handlePacket([]byte("open"))
 		assert.Error(t, err)
 	})
 
 	t.Run("Open packet with Sid only", func(t *testing.T) {
 		client.waitHandshake = make(chan struct{})
-		mockParser.EXPECT().Parse([]byte("open")).Return(&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"123"}`)}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("open")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"123"}`)}}, nil)
 		err := client.handlePacket([]byte("open"))
 		assert.NoError(t, err)
 		assert.Equal(t, "123", client.sid)
@@ -513,8 +513,8 @@ func TestClient_handlePacket(t *testing.T) {
 
 	t.Run("Few open packets", func(t *testing.T) {
 		client.waitHandshake = make(chan struct{})
-		mockParser.EXPECT().Parse([]byte("open")).Return(&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"123"}`)}, nil)
-		mockParser.EXPECT().Parse([]byte("open")).Return(&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"1234"}`)}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("open")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"123"}`)}}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("open")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketOpen, Data: []byte(`{"sid":"1234"}`)}}, nil)
 		err := client.handlePacket([]byte("open"))
 		assert.NoError(t, err)
 		assert.Equal(t, "123", client.sid)
@@ -524,7 +524,7 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Close packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("close")).Return(&engineio_v4.Message{Type: engineio_v4.PacketClose}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("close")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketClose}}, nil)
 		closeCalled := false
 		client.closeHandler = func() { closeCalled = true }
 		err := client.handlePacket([]byte("close"))
@@ -533,7 +533,7 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Ping packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("ping")).Return(&engineio_v4.Message{Type: engineio_v4.PacketPing}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("ping")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketPing}}, nil)
 		mockParser.EXPECT().Serialize(gomock.Any()).Return([]byte("pong"), nil)
 		mockTransport.EXPECT().SendMessage([]byte("pong")).Return(nil)
 		err := client.handlePacket([]byte("ping"))
@@ -541,7 +541,7 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Ping packet error", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("ping")).Return(&engineio_v4.Message{Type: engineio_v4.PacketPing}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("ping")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketPing}}, nil)
 		mockParser.EXPECT().Serialize(gomock.Any()).Return(nil, errors.New("serialize error"))
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
 		err := client.handlePacket([]byte("ping"))
@@ -549,20 +549,20 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Pong packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("pong")).Return(&engineio_v4.Message{Type: engineio_v4.PacketPong}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("pong")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketPong}}, nil)
 		err := client.handlePacket([]byte("pong"))
 		assert.NoError(t, err)
 	})
 
 	t.Run("Pong packet error", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("pong")).Return(nil, errors.New("parse error"))
+		mockParser.EXPECT().ParseBatch([]byte("pong")).Return(nil, errors.New("parse error"))
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
 		err := client.handlePacket([]byte("pong"))
 		assert.Error(t, err)
 	})
 
 	t.Run("Pong probe packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("pong probe")).Return(&engineio_v4.Message{Type: engineio_v4.PacketPong, Data: []byte("probe")}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("pong probe")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketPong, Data: []byte("probe")}}, nil)
 		mockParser.EXPECT().Serialize(&engineio_v4.Message{Type: engineio_v4.PacketUpgrade}).Return([]byte("5"), nil)
 		mockTransport.EXPECT().SendMessage([]byte("5")).Return(nil)
 		client.waitUpgrade = make(chan struct{})
@@ -571,7 +571,7 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Pong probe packet error", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("pong probe")).Return(&engineio_v4.Message{Type: engineio_v4.PacketPong, Data: []byte("probe")}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("pong probe")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketPong, Data: []byte("probe")}}, nil)
 		mockParser.EXPECT().Serialize(&engineio_v4.Message{Type: engineio_v4.PacketUpgrade}).Return([]byte("5"), nil)
 		mockTransport.EXPECT().SendMessage([]byte("5")).Return(errors.New("send error"))
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any())
@@ -581,7 +581,7 @@ func TestClient_handlePacket(t *testing.T) {
 	})
 
 	t.Run("Message packet", func(t *testing.T) {
-		mockParser.EXPECT().Parse([]byte("message")).Return(&engineio_v4.Message{Type: engineio_v4.PacketMessage, Data: []byte("test")}, nil)
+		mockParser.EXPECT().ParseBatch([]byte("message")).Return([]*engineio_v4.Message{&engineio_v4.Message{Type: engineio_v4.PacketMessage, Data: []byte("test")}}, nil)
 		messageCalled := false
 		client.messageHandler = func(data []byte) { messageCalled = true }
 		err := client.handlePacket([]byte("message"))
